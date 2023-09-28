@@ -4,12 +4,15 @@ import (
 	"math"
 	"runtime"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-kratos/aegis/internal/cpu"
 	"github.com/go-kratos/aegis/internal/window"
 	"github.com/go-kratos/aegis/ratelimit"
+	"github.com/pingcap/log"
+	"go.uber.org/zap"
 )
 
 var (
@@ -60,12 +63,17 @@ func min(l, r uint64) uint64 {
 
 // Stat contains the metrics snapshot of bbr.
 type Stat struct {
-	CPU         int64
-	InFlight    int64
-	MaxInFlight int64
-	MinRt       int64
-	MaxPass     int64
-	Raise       bool
+	Name             string
+	CPU              int64
+	InFlight         int64
+	MaxInFlight      int64
+	MinRt            int64
+	MaxPass          int64
+	Raise            bool
+	FixedInFlight    int64
+	FixedMinRT       int64
+	AppliedPenalty   float64
+	BroadcastPenalty float64
 }
 
 // counterCache is used to cache maxPASS and minRt result.
@@ -73,6 +81,11 @@ type Stat struct {
 // Cache time is equal to a bucket duration.
 type counterCache struct {
 	val  int64
+	time time.Time
+}
+
+type boolCache struct {
+	val  bool
 	time time.Time
 }
 
@@ -86,6 +99,14 @@ type options struct {
 	CPUThreshold int64
 	// CPUQuota
 	CPUQuota float64
+	Name     string
+}
+
+// WithName with window size.
+func WithName(name string) Option {
+	return func(o *options) {
+		o.Name = name
+	}
 }
 
 // WithWindow with window size.
@@ -134,17 +155,32 @@ type BBR struct {
 	minRtCache    atomic.Value
 	inFlightCache atomic.Value
 
-	mInFlight atomic.Int64
+	maxInFlight atomic.Int64
+	minRT       atomic.Int64
+
+	appliedPenalty atomic.Value
+
+	raiseCnt         int64
+	broadcastPenalty float64
+	pLock            sync.Mutex
 
 	opts options
 }
 
+const (
+	defaultWindowSize   = time.Second * 10
+	defaultBucketSize   = 100
+	defaultCPUThreshold = 800
+
+	defaultInFlightWindowSize = time.Minute
+)
+
 // NewLimiter returns a bbr limiter
 func NewLimiter(opts ...Option) *BBR {
 	opt := options{
-		Window:       time.Second * 10,
-		Bucket:       100,
-		CPUThreshold: 800,
+		Window:       defaultWindowSize,
+		Bucket:       defaultBucketSize,
+		CPUThreshold: defaultCPUThreshold,
 	}
 	for _, o := range opts {
 		o(&opt)
@@ -153,17 +189,21 @@ func NewLimiter(opts ...Option) *BBR {
 	bucketDuration := opt.Window / time.Duration(opt.Bucket)
 	passStat := window.NewRollingCounter(window.RollingCounterOpts{Size: opt.Bucket, BucketDuration: bucketDuration})
 	rtStat := window.NewRollingCounter(window.RollingCounterOpts{Size: opt.Bucket, BucketDuration: bucketDuration})
-	inFlightStat := window.NewRollingCounter(window.RollingCounterOpts{Size: opt.Bucket, BucketDuration: bucketDuration})
+
+	inFlightDuration := defaultInFlightWindowSize / time.Duration(defaultBucketSize)
+	inFlightStat := window.NewRollingCounter(window.RollingCounterOpts{Size: defaultBucketSize, BucketDuration: inFlightDuration})
 
 	limiter := &BBR{
-		opts:            opt,
-		passStat:        passStat,
-		rtStat:          rtStat,
-		inFlightStat:    inFlightStat,
-		bucketDuration:  bucketDuration,
-		bucketPerSecond: int64(time.Second / bucketDuration),
-		cpu:             func() int64 { return atomic.LoadInt64(&gCPU) },
+		opts:             opt,
+		passStat:         passStat,
+		rtStat:           rtStat,
+		inFlightStat:     inFlightStat,
+		bucketDuration:   bucketDuration,
+		bucketPerSecond:  int64(time.Second / bucketDuration),
+		cpu:              func() int64 { return atomic.LoadInt64(&gCPU) },
+		broadcastPenalty: 1.,
 	}
+	limiter.appliedPenalty.Store(1.)
 
 	if opt.CPUQuota != 0 {
 		// if cpuQuota is set, use new cpuGetter,Calculate the real CPU value based on the number of CPUs and Quota.
@@ -215,6 +255,16 @@ func (l *BBR) maxPASS() int64 {
 	return rawMaxPass
 }
 
+func (l *BBR) SetPenalty(p float64) {
+	l.appliedPenalty.Store(p)
+}
+
+func (l *BBR) GetBroadcasePenalty() float64 {
+	l.pLock.Lock()
+	defer l.pLock.Unlock()
+	return l.broadcastPenalty
+}
+
 // timespan returns the passed bucket count
 // since lastTime, if it is one bucket duration earlier than
 // the last recorded time, it will return the BucketNum.
@@ -226,7 +276,7 @@ func (l *BBR) timespan(lastTime time.Time) int {
 	return l.opts.Bucket
 }
 
-func (l *BBR) minRT() int64 {
+func (l *BBR) getMinRT() int64 {
 	rtCache := l.minRtCache.Load()
 	if rtCache != nil {
 		rc := rtCache.(*counterCache)
@@ -260,22 +310,23 @@ func (l *BBR) minRT() int64 {
 	return rawMinRT
 }
 
-func (l *BBR) maxInFlight() int64 {
-	f := l.mInFlight.Load()
+func (l *BBR) getMaxInFlight() int64 {
+	f := l.maxInFlight.Load()
 	if f == 0 {
-		return int64(math.Floor(float64(l.maxPASS()*l.minRT()*l.bucketPerSecond)/1000.0) + 0.5)
+		return int64(math.Floor(float64(l.maxPASS()*l.getMinRT()*l.bucketPerSecond)/1000.0) + 0.5)
 	}
-	return f
+	penalty := l.appliedPenalty.Load().(float64)
+	return int64(penalty*float64(f) + 0.5)
 }
 
 func (l *BBR) isRising() bool {
 	inFlightCache := l.inFlightCache.Load()
-	last := int64(0)
+	last := false
 	if inFlightCache != nil {
-		rc := inFlightCache.(*counterCache)
+		rc := inFlightCache.(*boolCache)
 		last = rc.val
 		if l.timespan(rc.time) < 1 {
-			return rc.val > 0
+			return rc.val
 		}
 	}
 	positive := 0
@@ -284,11 +335,11 @@ func (l *BBR) isRising() bool {
 		var result = 0.
 		for i := 1; iterator.Next() && i < l.opts.Bucket; i++ {
 			bucket := iterator.Bucket()
+			total := 0.0
 			if len(bucket.Points) == 0 {
 				negative++
 				continue
 			}
-			total := 0.0
 			for _, p := range bucket.Points {
 				total += p
 			}
@@ -302,24 +353,46 @@ func (l *BBR) isRising() bool {
 		return result
 	}))
 	ans := last
-	// log.Info("raise", zap.Float64("raises", raises), zap.Int("positive", positive), zap.Int("negative", negative))
-	if ans == 0 && raises > 0 && positive > negative {
-		ans = 1
-		l.mInFlight.CompareAndSwap(0, l.maxInFlight())
-	} else if ans == 1 && atomic.LoadInt64(&l.inFlight) == 0 {
-		l.mInFlight.Store(0)
-		ans = 0
+	if !ans && raises > 0 && positive > negative {
+		ans = true
+		if l.maxInFlight.CompareAndSwap(0, l.getMaxInFlight()) {
+			l.minRT.Store(l.getMinRT())
+			log.Info("limiter stat", zap.Any("Stat", l.Stat()))
+		}
+	} else if ans && atomic.LoadInt64(&l.inFlight) == 0 {
+		l.maxInFlight.Store(0)
+		l.pLock.Lock()
+		l.raiseCnt = 0
+		l.broadcastPenalty = 1.
+		l.pLock.Unlock()
+		ans = false
+	} else if ans {
+		l.pLock.Lock()
+		l.raiseCnt++
+		if l.raiseCnt > 200 {
+			penalty := l.broadcastPenalty * 0.9
+			if penalty < 0.3 {
+				penalty = 0.3
+			}
+			l.broadcastPenalty = penalty
+			l.raiseCnt = 0
+		}
+		l.pLock.Unlock()
 	}
-	l.inFlightCache.Store(&counterCache{
+	l.inFlightCache.Store(&boolCache{
 		val:  ans,
 		time: time.Now(),
 	})
-	return ans > 0
+	return ans
+}
+
+func (l *BBR) ShouldCheck() bool {
+	return l.cpu() >= l.opts.CPUThreshold || l.isRising()
 }
 
 func (l *BBR) shouldDrop() bool {
 	now := time.Duration(time.Now().UnixNano())
-	if l.cpu() < l.opts.CPUThreshold && !l.isRising() {
+	if !l.ShouldCheck() {
 		// current cpu payload below the threshold
 		prevDropTime, _ := l.prevDropTime.Load().(time.Duration)
 		if prevDropTime == 0 {
@@ -331,14 +404,15 @@ func (l *BBR) shouldDrop() bool {
 			// just start drop one second ago,
 			// check current inflight count
 			inFlight := atomic.LoadInt64(&l.inFlight)
-			return inFlight > 1 && inFlight > l.maxInFlight()
+			return inFlight > 1 && inFlight > l.getMaxInFlight()
 		}
 		l.prevDropTime.CompareAndSwap(prevDropTime, time.Duration(0))
 		return false
 	}
 	// current cpu payload exceeds the threshold
 	inFlight := atomic.LoadInt64(&l.inFlight)
-	drop := inFlight > 1 && inFlight > l.maxInFlight() && l.minRT() > 0
+	// // The rate limiting policy applies only to API whose RT exceeds 1ms.
+	drop := inFlight > 1 && inFlight > l.getMaxInFlight()
 	if drop {
 		prevDrop, _ := l.prevDropTime.Load().(time.Duration)
 		if prevDrop != 0 {
@@ -353,13 +427,21 @@ func (l *BBR) shouldDrop() bool {
 
 // Stat tasks a snapshot of the bbr limiter.
 func (l *BBR) Stat() Stat {
+	l.pLock.Lock()
+	broadcastPenalty := l.broadcastPenalty
+	l.pLock.Unlock()
 	return Stat{
-		CPU:         l.cpu(),
-		MinRt:       l.minRT(),
-		MaxPass:     l.maxPASS(),
-		MaxInFlight: l.maxInFlight(),
-		InFlight:    atomic.LoadInt64(&l.inFlight),
-		Raise:       l.isRising(),
+		Name:             l.opts.Name,
+		CPU:              l.cpu(),
+		MinRt:            l.getMinRT(),
+		MaxPass:          l.maxPASS(),
+		MaxInFlight:      l.getMaxInFlight(),
+		InFlight:         atomic.LoadInt64(&l.inFlight),
+		Raise:            l.isRising(),
+		FixedInFlight:    l.maxInFlight.Load(),
+		FixedMinRT:       l.minRT.Load(),
+		AppliedPenalty:   l.appliedPenalty.Load().(float64),
+		BroadcastPenalty: broadcastPenalty,
 	}
 }
 
@@ -375,7 +457,7 @@ func (l *BBR) Allow() (ratelimit.DoneFunc, error) {
 	ms := float64(time.Millisecond)
 	return func(ratelimit.DoneInfo) {
 		//nolint
-		if rt := int64(math.Ceil(float64(time.Now().UnixNano()-start)) / ms); rt > 0 {
+		if rt := int64(math.Ceil(float64(time.Now().UnixNano()-start) / ms)); rt > 0 {
 			l.rtStat.Add(rt)
 		}
 		atomic.AddInt64(&l.inFlight, -1)

@@ -114,12 +114,12 @@ func TestBBRMinRt(t *testing.T) {
 			time.Sleep(bucketDuration)
 		}
 	}
-	assert.Equal(t, int64(6), bbr.minRT())
+	assert.Equal(t, int64(6), bbr.getMinRT())
 
 	// default max min rt is equal to maxFloat64.
 	bbr = NewLimiter(optsForTest...)
 	bbr.rtStat = window.NewRollingCounter(window.RollingCounterOpts{Size: 10, BucketDuration: bucketDuration})
-	assert.Equal(t, int64(1), bbr.minRT())
+	assert.Equal(t, int64(1), bbr.getMinRT())
 }
 
 func TestBBRMinRtWithCache(t *testing.T) {
@@ -132,7 +132,7 @@ func TestBBRMinRtWithCache(t *testing.T) {
 		if i != 9 {
 			time.Sleep(bucketDuration / 2)
 		}
-		_ = bbr.minRT()
+		_ = bbr.getMinRT()
 		for j := i*10 + 6; j <= i*10+10; j++ {
 			bbr.rtStat.Add(int64(j))
 		}
@@ -140,7 +140,7 @@ func TestBBRMinRtWithCache(t *testing.T) {
 			time.Sleep(bucketDuration / 2)
 		}
 	}
-	assert.Equal(t, int64(6), bbr.minRT())
+	assert.Equal(t, int64(6), bbr.getMinRT())
 }
 
 func TestBBRMaxQps(t *testing.T) {
@@ -159,7 +159,7 @@ func TestBBRMaxQps(t *testing.T) {
 	}
 	bbr.passStat = passStat
 	bbr.rtStat = rtStat
-	assert.Equal(t, int64(60), bbr.maxInFlight())
+	assert.Equal(t, int64(60), bbr.getMaxInFlight())
 }
 
 func TestBBRShouldDrop(t *testing.T) {
@@ -227,9 +227,9 @@ func BenchmarkBBRAllowUnderHighLoad(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i <= b.N; i++ {
 		if i%10000 == 0 {
-			maxFlight := bbr.maxInFlight()
+			maxFlight := bbr.getMaxInFlight()
 			if maxFlight != 0 {
-				bbr.inFlight = rand.Int63n(bbr.maxInFlight() * 2)
+				bbr.inFlight = rand.Int63n(bbr.getMaxInFlight() * 2)
 			}
 		}
 		done, err := bbr.Allow()
